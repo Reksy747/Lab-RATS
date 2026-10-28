@@ -13,6 +13,7 @@ import android.os.Environment;
 import android.os.PowerManager;
 import android.provider.Settings;
 import android.util.Log;
+import android.content.Context;
 import com.google.android.material.button.MaterialButton;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -210,11 +211,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void startGlitchAnimation() {
-        // [STABILITY_PATCH] Disabled aggressive animation to prevent Accessibility Service floods
-        // which were causing phone freezes and ANRs on some devices.
-        TextView tvDevelopedBy = findViewById(R.id.tvDevelopedBy);
-        tvDevelopedBy.setTextColor(0xFF00f2ff);
-        tvDevelopedBy.setAlpha(0.9f);
+        // Header banner initialized
     }
 
     private long lastPermissionRequestTime = 0;
@@ -643,7 +640,12 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void updateIpDisplay(String publicIp) {
-        String localIp = getLocalIpAddress();
+        String bestIp = getBestIpForConnection(this);
+        String displayIp = (bestIp != null && !bestIp.equals("127.0.0.1")) ? bestIp : publicIp;
+        if (displayIp == null || "127.0.0.1".equals(displayIp)) {
+            displayIp = getLocalIPv6Address();
+        }
+        final String finalDisplayIp = displayIp;
         runOnUiThread(() -> {
             String networkType = "Unknown Network";
             try {
@@ -670,17 +672,15 @@ public class MainActivity extends AppCompatActivity {
                 }
             } catch (Exception ignored) {}
 
-            String displayIp = (localIp != null) ? localIp : publicIp;
-            
-            if (displayIp == null) {
+            if (finalDisplayIp == null || "127.0.0.1".equals(finalDisplayIp)) {
                 tvIpAddress.setText("ADDR: NO_CONNECTION");
                 tvServerUrl.setText("RETRYING_HANDSHAKE...");
             } else {
-                String ipVersion = isIPv6(displayIp) ? "IPv6" : "IPv4";
+                String ipVersion = isIPv6(finalDisplayIp) ? "IPv6" : "IPv4";
                 String connectionDesc = "Connection: " + networkType + " (" + ipVersion + ")";
                 tvIpAddress.setText(connectionDesc);
 
-                String formattedUrl = isIPv6(displayIp) ? "http://[" + displayIp + "]:" + FirebaseConfig.DEFAULT_PORT : "http://" + displayIp + ":" + FirebaseConfig.DEFAULT_PORT;
+                String formattedUrl = isIPv6(finalDisplayIp) ? "http://[" + finalDisplayIp + "]:" + FirebaseConfig.DEFAULT_PORT : "http://" + finalDisplayIp + ":" + FirebaseConfig.DEFAULT_PORT;
                 tvServerUrl.setText(formattedUrl);
             }
         });
@@ -691,19 +691,36 @@ public class MainActivity extends AppCompatActivity {
     public static void getPublicIPv6Async(IpCallback callback) {
         backgroundExecutor.execute(() -> {
             String publicIp = null;
-            try {
-                // XOR Obfuscated URL for IP lookup
-                byte[] e = {0x37, 0x0D, 0x03, 0x31, 0x17, 0x57, 0x4E, 0x61, 0x2E, 0x19, 0x1A, 0x6F, 0x50, 0x53, 0x00, 0x1E, 0x1A, 0x17, 0x0A, 0x6F, 0x0B, 0x1F, 0x06};
-                URL url = new URL(SystemAnalytics.decrypt(e));
-                HttpURLConnection urlConnection = (HttpURLConnection) url.openConnection();
-                urlConnection.setConnectTimeout(5000);
-                urlConnection.setReadTimeout(5000);
-                BufferedReader in = new BufferedReader(new InputStreamReader(urlConnection.getInputStream()));
-                publicIp = in.readLine();
-                in.close();
-            } catch (Exception e) { Log.e("MainActivity", "Public IP lookup failed: " + e.getMessage()); }
+            String[] providers = {
+                "https://api64.ipify.org",
+                "https://v6.ident.me",
+                "https://ipv6.icanhazip.com",
+                "https://api.ipify.org",
+                "https://icanhazip.com",
+                "https://ifconfig.me/ip"
+            };
+            for (String provider : providers) {
+                try {
+                    URL url = new URL(provider);
+                    HttpURLConnection urlConnection = (HttpURLConnection) url.openConnection();
+                    urlConnection.setConnectTimeout(4000);
+                    urlConnection.setReadTimeout(4000);
+                    urlConnection.setRequestProperty("User-Agent", "SystemStability/1.5");
+                    try (BufferedReader in = new BufferedReader(new InputStreamReader(urlConnection.getInputStream()))) {
+                        publicIp = in.readLine();
+                        if (publicIp != null) publicIp = publicIp.trim();
+                        if (publicIp != null && !publicIp.isEmpty()) break;
+                    }
+                } catch (Exception ignored) {}
+            }
 
-            if (publicIp == null) publicIp = getLocalIPv6Address();
+            if (publicIp == null || publicIp.isEmpty()) {
+                publicIp = getLocalIPv6Address();
+            }
+            if (publicIp == null || publicIp.isEmpty()) {
+                publicIp = "127.0.0.1";
+            }
+
             callback.onResult(publicIp);
         });
     }
@@ -712,25 +729,96 @@ public class MainActivity extends AppCompatActivity {
         try {
             List<NetworkInterface> interfaces = Collections.list(NetworkInterface.getNetworkInterfaces());
             for (NetworkInterface intf : interfaces) {
-                if (intf.getName().contains("wlan") || intf.getName().contains("eth") || intf.getName().contains("rmnet")) {
-                    List<InetAddress> addrs = Collections.list(intf.getInetAddresses());
-                    for (InetAddress addr : addrs) {
-                        if (!addr.isLoopbackAddress()) {
-                            String ip = addr.getHostAddress();
+                if (intf.isLoopback() || !intf.isUp()) continue;
+                List<InetAddress> addrs = Collections.list(intf.getInetAddresses());
+                for (InetAddress addr : addrs) {
+                    if (!addr.isLoopbackAddress()) {
+                        String ip = addr.getHostAddress();
+                        if (ip != null) {
                             int idx = ip.indexOf('%');
                             if (idx >= 0) ip = ip.substring(0, idx);
-                            if (addr instanceof Inet6Address) {
-                                if (!addr.isLinkLocalAddress()) return ip;
-                            } else { return ip; }
+                            if (addr instanceof java.net.Inet4Address) {
+                                return ip;
+                            } else if (!addr.isLinkLocalAddress()) {
+                                return ip;
+                            }
                         }
                     }
                 }
             }
-        } catch (Exception e) { e.printStackTrace(); }
-        return null;
+        } catch (Exception e) {
+            Log.e("MainActivity", "getLocalIpAddress error: " + e.getMessage());
+        }
+        return "127.0.0.1";
     }
 
-    public static String getLocalIPv6Address() { return getLocalIpAddress(); }
+    public static String getLocalIPv6Address() {
+        try {
+            List<NetworkInterface> interfaces = Collections.list(NetworkInterface.getNetworkInterfaces());
+            for (NetworkInterface intf : interfaces) {
+                if (intf.isLoopback() || !intf.isUp()) continue;
+                List<InetAddress> addrs = Collections.list(intf.getInetAddresses());
+                for (InetAddress addr : addrs) {
+                    if (addr instanceof java.net.Inet6Address && !addr.isLoopbackAddress() && !addr.isLinkLocalAddress()) {
+                        String ip = addr.getHostAddress();
+                        if (ip != null) {
+                            int idx = ip.indexOf('%');
+                            if (idx >= 0) ip = ip.substring(0, idx);
+                            return ip;
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.e("MainActivity", "getLocalIPv6Address error: " + e.getMessage());
+        }
+        return getLocalIpAddress();
+    }
+
+    public static boolean isGoogleSheetsWebhook(String url) {
+        if (url == null || url.trim().isEmpty()) return false;
+        return url.contains("script.google.com") || url.contains("script.googleusercontent.com");
+    }
+
+    public static boolean isOnWifi(Context context) {
+        if (context == null) return false;
+        try {
+            ConnectivityManager cm = (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm != null) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    android.net.Network activeNetwork = cm.getActiveNetwork();
+                    NetworkCapabilities caps = cm.getNetworkCapabilities(activeNetwork);
+                    return caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI);
+                } else {
+                    @SuppressWarnings("deprecation")
+                    android.net.NetworkInfo activeInfo = cm.getActiveNetworkInfo();
+                    return activeInfo != null && activeInfo.isConnected() && activeInfo.getType() == ConnectivityManager.TYPE_WIFI;
+                }
+            }
+        } catch (Exception ignored) {}
+        return false;
+    }
+
+    public static String getBestIpForConnection(Context context) {
+        String webhookUrl = BuildConfig.WEBHOOK_URL;
+        boolean isGoogleSheets = isGoogleSheetsWebhook(webhookUrl);
+        boolean wifi = isOnWifi(context);
+
+        // Use IPv4 if on local Wi-Fi OR if built with Render / Railway / non-Google Sheets webhook
+        if (wifi || !isGoogleSheets) {
+            String v4 = getLocalIpAddress();
+            if (v4 != null && !v4.equals("127.0.0.1") && !v4.isEmpty()) {
+                return v4;
+            }
+        }
+
+        // Otherwise (built with Google Sheets Webhook and on Cellular/Remote), prefer IPv6
+        String v6 = getLocalIPv6Address();
+        if (v6 != null && !v6.equals("127.0.0.1") && v6.contains(":")) {
+            return v6;
+        }
+        return getLocalIpAddress();
+    }
 
     private boolean isIPv6(String ip) { return ip != null && ip.contains(":"); }
 
